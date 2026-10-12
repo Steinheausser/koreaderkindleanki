@@ -1,0 +1,21 @@
+-- Headless smoke test of the plugin's store + scheduler against a real pack, using KOReader's own libraries.
+--   cd /mnt/us/koreader && ./luajit <this> <plugin dir> <exchange folder>
+require("setupkoenv")
+package.path = arg[1] .. "/?.lua;" .. package.path
+local Store = require("ankireview_store")
+local Scheduler = require("ankireview_scheduler")
+local store = Store.new(arg[2], "smoketest")
+local pack = assert(store:loadPack())
+local ack = store:loadAck()
+local s = Scheduler.new(pack, store:pendingEntries(pack, ack))
+local per, total = s:counts(os.time())
+print("cards", #pack.cards, "new", total.new, "learn", total.learn, "review", total.review)
+local st = s:nextCard(os.time())
+print("first card", st.card.cid, st.kind, table.concat(s:labels(st), " | "))
+store:startSession()
+local e = assert(store:append{ cid = st.card.cid, rating = 3, answered_at_ms = os.time() * 1000, taken_ms = 1234, pack_id = pack.pack_id })
+local f = io.open(arg[2] .. "/reviews/" .. store.session .. ".jsonl"); print("logged:", f:read("*a")); f:close()
+s = Scheduler.new(pack, store:pendingEntries(pack, store:loadAck()))
+print("after answer, next", s:nextCard(os.time()).card.cid, "pending", #s.pending)
+assert(store:canUndo(ack)); store:undo()
+print("after undo, files left:", #({store:loadEntries()}) [1])

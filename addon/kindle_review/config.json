@@ -1,0 +1,7 @@
+{
+    "folder": "",
+    "days_ahead": 4,
+    "enabled": true,
+    "sync_after_import": true,
+    "auto_interval_minutes": 10
+}
