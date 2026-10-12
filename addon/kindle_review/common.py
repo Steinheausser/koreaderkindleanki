@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import os
 
-FORMAT = 1
+FORMAT = 2  # pack.json format; cards' HTML lives in pack/cards-<pack_id>.bin (see export.write_pack)
+ACK_FORMAT = 1  # ack.json format: independent of the pack format
+CARDS_PREFIX = "cards-"
+CARDS_SUFFIX = ".bin"
 PACK_DIR = "pack"
 PACK_FILE = "pack.json"
 MEDIA_DIR = "media"

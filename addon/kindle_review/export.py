@@ -183,7 +183,7 @@ def _sync_media(src_files: dict[str, str], media_dir: str) -> int:
 
 def write_pack(col, data: PackData, folder: str, math_cache: mathrender.MathCache | None,
                applied_ids: list[str]) -> dict:
-    """Write pack/media/* then pack/pack.json (atomically) into the exchange folder."""
+    """Write pack/media/*, then pack/cards-<pack_id>.bin, then pack/pack.json (all atomically) into the exchange folder."""
     common.ensure_layout(folder)
     used_math: set[str] = set()
     if math_cache is not None:
@@ -199,17 +199,58 @@ def write_pack(col, data: PackData, folder: str, math_cache: mathrender.MathCach
     media_dir = os.path.join(folder, common.PACK_DIR, common.MEDIA_DIR)
     copied = _sync_media(files, media_dir)
 
+    pack_dir = os.path.join(folder, common.PACK_DIR)
     now_ms = int(time.time() * 1000)
+    while os.path.exists(os.path.join(pack_dir, _cards_name(str(now_ms)))):  # same-millisecond rewrite
+        now_ms += 1
+    pack_id = str(now_ms)
+    cards_name = _cards_name(pack_id)
+
+    # Cards' HTML goes to a side file the Kindle reads one slice at a time: q then a per card, no separators.
+    blob = bytearray()
+    records = []
+    for c in data.cards:
+        q, a = c["q"].encode("utf-8"), c["a"].encode("utf-8")
+        rec = {k: v for k, v in c.items() if k not in ("q", "a")}
+        rec["qo"], rec["ql"] = len(blob), len(q)
+        blob += q
+        rec["ao"], rec["al"] = len(blob), len(a)
+        blob += a
+        records.append(rec)
+    common.atomic_write_bytes(os.path.join(pack_dir, cards_name), bytes(blob))
+
     pack = {
         "format": common.FORMAT,
-        "pack_id": str(now_ms),
+        "pack_id": pack_id,
         "generated_at": now_ms,
         "today": data.today,
         "day_cutoff": data.day_cutoff,
         "applied": applied_ids,
+        "cards_file": cards_name,
         "decks": data.decks,
         "css": data.css,
-        "cards": data.cards,
+        "cards": records,
     }
-    common.atomic_write_json(os.path.join(folder, common.PACK_DIR, common.PACK_FILE), pack)
+    common.atomic_write_json(os.path.join(pack_dir, common.PACK_FILE), pack)
+    _prune_cards_files(pack_dir, cards_name)
     return {"cards": len(data.cards), "media_copied": copied, "media_total": len(files)}
+
+
+def _cards_name(pack_id: str) -> str:
+    return common.CARDS_PREFIX + pack_id + common.CARDS_SUFFIX
+
+
+def _prune_cards_files(pack_dir: str, current: str) -> None:
+    """Keep the current cards file plus the newest previous one (a Kindle may still be reading it); delete the rest."""
+    def pack_id_of(name: str) -> int:
+        digits = name[len(common.CARDS_PREFIX):-len(common.CARDS_SUFFIX)]
+        return int(digits) if digits.isdigit() else -1
+
+    others = sorted((n for n in os.listdir(pack_dir)
+                     if n.startswith(common.CARDS_PREFIX) and n.endswith(common.CARDS_SUFFIX) and n != current),
+                    key=lambda n: (pack_id_of(n), n))
+    for name in others[:-1]:
+        try:
+            os.remove(os.path.join(pack_dir, name))
+        except OSError:  # e.g. still open by Syncthing; the next export retries
+            pass

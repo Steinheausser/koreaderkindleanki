@@ -31,7 +31,7 @@ newer (MTP) Kindles keep USB file transfer working while KOReader is running.
 
 ## Setup
 1. **Syncthing folder.** On the PC create a folder, e.g. `C:\Users\<you>\anki-kindle`, and add it in Syncthing
-   with folder ID **`anki-kindle`** (the Kindle's *Sync now* button uses this ID). Share it with the Kindle
+   with folder ID **`anki-kindle`** (the Kindle's *Sync with PC* button uses this ID). Share it with the Kindle
    and accept it there at **`/mnt/us/anki-kindle`**. Put a `.stignore` containing `*.tmp` in the folder on
    both sides.
 2. **Anki add-on.**
@@ -47,9 +47,13 @@ newer (MTP) Kindles keep USB file transfer working while KOReader is running.
 
 ## Using it
 **On the Kindle**, use the *Anki review* tab:
-- *Review all decks* or *Decks* → pick a deck. Tap *Show answer*, then Again / Hard / Good / Easy.
-  Page-turn keys also work: forward = show answer / Good, back = Again. Undo is available.
-- *Sync now* starts KOReader's Syncthing if needed and syncs with the PC (Wi-Fi must be on).
+- *Review all decks* or *Decks* → pick a deck. Tap the card (or *Show answer*), then Again / Hard / Good / Easy.
+  The menu icon at the top left has Undo, card font size and Refresh. Page-turn keys also work:
+  forward = show answer / Good, back = Undo.
+- Deck rows show `new · learn · review` counts; decks with nothing due are under *Finished decks*. The title
+  bar warns when the cards are a day or more old.
+- *Card font size* sets the text size for cards (images and math scale with it).
+- *Sync with PC* starts KOReader's Syncthing if needed and syncs with the PC (Wi-Fi must be on).
 - *Status* shows how old the cards are and how many answers haven't reached Anki yet.
 - *Exchange folder* lets you pick a different folder than `/mnt/us/anki-kindle`.
 
@@ -77,14 +81,18 @@ Math (MathJax `\( \)` / `\[ \]`) is pre-rendered to SVG on the PC. Images are co
   source. Such clozes are malformed in Anki too; add a space before `}}` to fix them.
 
 ## How it works
-### File formats (`"format": 1`)
+### File formats (`"format": 2`; the plugin also reads format 1)
 - **`pack/pack.json`**, written by the PC:
   - `pack_id`, `generated_at` (ms).
   - `today` and `day_cutoff`: Anki's day number and rollover time, so the Kindle needs no timezone.
   - `applied`: ids of Kindle answers already reflected in the pack.
   - `decks`: today's remaining and per-day limits, learning/relearning steps in seconds, bury flags.
   - `css`: one stylesheet per note type.
-  - `cards`: `cid nid did mid queue type mod left labels q a`, plus `due_day` / `due_at` / `new_pos`.
+  - `cards`: `cid nid did mid queue type mod left labels`, plus `due_day` / `due_at` / `new_pos`, and
+    `qo ql ao al`: byte offset and length of the question and answer HTML in `cards_file`.
+  - `cards_file`: `cards-<pack_id>.bin`, all cards' HTML concatenated, written before `pack.json`. Keeping
+    the HTML out of the JSON makes the pack load several times faster on the Kindle. The PC keeps the
+    previous one too, and the Kindle keeps using its current pack until a new pack's file has fully arrived.
   - Math is pre-rendered to `pack/media/math-*.svg`; images are copied to `pack/media/`.
 - **`reviews/<device>-<session>.jsonl`**, written by the Kindle:
   - One answer per line: `id cid rating answered_at_ms taken_ms pack_id`.
@@ -118,6 +126,8 @@ QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests
 Helpers for when you change rendering or scheduling:
 - `tests/make_test_pack.py` builds a pack from a throwaway collection.
 - `tests/render_cards.lua` renders every card the way the reviewer does.
+- `tests/test_store.lua` (pack/log storage) and `tests/headless_ui.lua` (drives the real reviewer widgets
+  off-screen) run on the Kindle; `tests/make_format2.lua` converts a format-1 pack.
 - `tests/bench_pack.lua` times operations on a real pack, read-only.
 
 ## Bonus: USB file transfer (MTP) while KOReader runs

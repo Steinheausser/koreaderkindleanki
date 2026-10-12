@@ -3,8 +3,9 @@ Offline review queue for a card pack exported by the Anki "kindle_review" add-on
 
 Pure Lua (no KOReader dependencies) so it can be unit-tested with plain luajit.
 
-The state is always rebuilt from (pack, local answers the pack doesn't reflect yet), which makes undo,
-restarts and new packs trivial. This only decides *what to show when*; the real scheduling happens
+The state is built from (pack, local answers the pack doesn't reflect yet), which makes undo, restarts
+and new packs trivial; new answers are then applied incrementally (Scheduler:answer), which gives exactly
+the same state as rebuilding. This only decides *what to show when*; the real scheduling happens
 later on the PC, when Anki replays the recorded answers.
 ]]
 
@@ -102,6 +103,7 @@ end
 
 -- Delay (seconds) the learning step `step` (1-based) waits after an answer, or nil when it graduates.
 local function learnDelay(steps, step, rating)
+    if not steps[1] then return nil end -- no (re)learning steps: the card leaves the queue
     if rating == AGAIN then return steps[1], 1 end
     if rating == HARD then
         local cur = steps[step] or steps[#steps]
@@ -156,6 +158,25 @@ function Scheduler:_apply(st, rating, ts)
     end
 end
 
+--- Record a new answer (same effect as rebuilding with `entry` added to the answers).
+--- @param st table card state from this scheduler
+--- @param entry table the logged answer ({id, cid, rating, answered_at_ms, ...})
+function Scheduler:answer(st, rating, ts, entry)
+    local last = self.pending[#self.pending]
+    if last and (last.answered_at_ms > entry.answered_at_ms
+            or (last.answered_at_ms == entry.answered_at_ms and last.id > entry.id)) then
+        -- clock went backwards: replaying in time order differs from appending, so rebuild
+        local list = { entry }
+        for _, e in ipairs(self.pending) do table.insert(list, e) end
+        local fresh = Scheduler.new(self.pack, list)
+        for k in pairs(self) do self[k] = nil end
+        for k, v in pairs(fresh) do self[k] = v end
+        return
+    end
+    table.insert(self.pending, entry)
+    self:_apply(st, rating, ts)
+end
+
 --- Button labels for the four ratings.
 function Scheduler:labels(st)
     if st.first and st.card.labels and #st.card.labels == 4 then return st.card.labels end
@@ -202,7 +223,10 @@ function Scheduler:available(now, did)
             end
         end
     end
-    table.sort(learn, function(a, b) return a.due_at < b.due_at end)
+    table.sort(learn, function(a, b)
+        if a.due_at ~= b.due_at then return a.due_at < b.due_at end
+        return a.idx < b.idx
+    end)
     table.sort(review, function(a, b)
         if a.due_day ~= b.due_day then return a.due_day < b.due_day end
         return a.idx < b.idx
@@ -226,32 +250,98 @@ function Scheduler:available(now, did)
     return learn, review, new, next_learn
 end
 
---- The card to show now (or nil) and, if none, when the next learning card becomes due.
-function Scheduler:nextCard(now, did)
-    local learn, review, new, next_learn = self:available(now, did)
-    if learn[1] then return learn[1] end
-    if review[1] then return review[1] end
-    if new[1] then return new[1] end
-    if next_learn and next_learn - now <= LEARN_AHEAD then
-        local l = self:available(next_learn, did)
-        if l[1] then return l[1] end
-    end
-    return nil, next_learn
-end
-
---- {did = {new=, learn=, review=}} plus totals, for the deck list.
-function Scheduler:counts(now)
-    local learn, review, new = self:available(now)
-    local per, total = {}, { new = #new, learn = #learn, review = #review }
-    local function add(list, field)
-        for _, st in ipairs(list) do
-            local d = per[st.card.did] or { new = 0, learn = 0, review = 0 }
-            d[field] = d[field] + 1
-            per[st.card.did] = d
+-- One pass over the cards, without sorting: what is available at `now` after daily limits, and the first card
+-- of each queue in the order available() would give. Results are identical to available()'s.
+function Scheduler:_scan(now, did, want_per)
+    local pack = self.pack
+    local day = Scheduler.ankiDay(pack, now)
+    local is_today = day == pack.today
+    local buried = self.buried[day] or {}
+    local left = {} -- per deck: { rev =, new = } still allowed today
+    local raw = {}  -- per deck: { learn =, rev =, day =, new = } before limits
+    local first_learn, first_rev, first_new, next_learn
+    local n_learn = 0
+    for _, st in ipairs(self.order) do
+        if not st.done and inDeck(st, did) and not buried[st.card.cid] then
+            local kind = st.kind
+            local deck_id = st.card.did
+            if kind == "learn" then
+                if st.due_at <= now then
+                    n_learn = n_learn + 1
+                    if not first_learn or st.due_at < first_learn.due_at
+                            or (st.due_at == first_learn.due_at and st.idx < first_learn.idx) then
+                        first_learn = st
+                    end
+                    if want_per then
+                        local r = raw[deck_id] or { learn = 0, rev = 0, day = 0, new = 0 }
+                        raw[deck_id] = r
+                        r.learn = r.learn + 1
+                    end
+                elseif not next_learn or st.due_at < next_learn then
+                    next_learn = st.due_at
+                end
+            elseif kind == "new" or ((kind == "review" or kind == "dayLearn") and st.due_day <= day) then
+                local l = left[deck_id]
+                if not l then
+                    local d = pack.decks[tostring(deck_id)]
+                    local u = self:_used(day, deck_id)
+                    l = { rev = (is_today and d.rev_today or d.rev_per_day) - u.rev,
+                          new = (is_today and d.new_today or d.new_per_day) - u.new }
+                    left[deck_id] = l
+                end
+                local r = raw[deck_id] or { learn = 0, rev = 0, day = 0, new = 0 }
+                raw[deck_id] = r
+                if kind == "new" then
+                    r.new = r.new + 1
+                    if l.new > 0 and (not first_new or st.idx < first_new.idx) then first_new = st end
+                else
+                    if kind == "review" then r.rev = r.rev + 1 else r.day = r.day + 1 end
+                    if (kind == "dayLearn" or l.rev > 0) and (not first_rev or st.due_day < first_rev.due_day
+                            or (st.due_day == first_rev.due_day and st.idx < first_rev.idx)) then
+                        first_rev = st
+                    end
+                end
+            end
         end
     end
-    add(learn, "learn"); add(review, "review"); add(new, "new")
-    return per, total
+    local total = { new = 0, learn = n_learn, review = 0 }
+    local per = want_per and {} or nil
+    for deck_id, r in pairs(raw) do
+        local l = left[deck_id]
+        local rev = r.day + (l and math.min(r.rev, math.max(0, l.rev)) or 0)
+        local new = l and math.min(r.new, math.max(0, l.new)) or 0
+        total.review = total.review + rev
+        total.new = total.new + new
+        if per and (r.learn + rev + new) > 0 then per[deck_id] = { new = new, learn = r.learn, review = rev } end
+    end
+    return {
+        first_learn = first_learn, first_review = first_rev, first_new = first_new, next_learn = next_learn,
+        new = total.new, learn = total.learn, review = total.review, per = per,
+    }
+end
+
+--- The card to show now (or nil), plus the counts for the deck ({new=, learn=, review=, next_learn=}).
+--- When no card is returned, counts.next_learn tells when the next learning card becomes due (if any).
+function Scheduler:queue(now, did)
+    local q = self:_scan(now, did)
+    local st = q.first_learn or q.first_review or q.first_new
+    if not st and q.next_learn and q.next_learn - now <= LEARN_AHEAD then
+        st = self:_scan(q.next_learn, did).first_learn
+    end
+    return st, q
+end
+
+--- The card to show now (or nil) and, if none, when the next learning card becomes due.
+function Scheduler:nextCard(now, did)
+    local st, q = self:queue(now, did)
+    if st then return st end
+    return nil, q.next_learn
+end
+
+--- {did = {new=, learn=, review=}} (decks with nothing available are left out) plus totals, for the deck list.
+function Scheduler:counts(now)
+    local q = self:_scan(now, nil, true)
+    return q.per, { new = q.new, learn = q.learn, review = q.review }
 end
 
 return Scheduler

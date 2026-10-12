@@ -118,5 +118,133 @@ test("future-day reviews appear on their day", function()
     eq(#review, 3, "cid 6 due tomorrow joins")
 end)
 
+-- Random packs: several decks with different limits, siblings, all queue kinds.
+local function lcg(seed)
+    local x = seed * 7919 + 1
+    return function(a, b)
+        x = (x * 16807) % 2147483647 -- Park-Miller: exact in doubles (LuaJIT) and integers alike
+        return a + math.floor(x / 7) % (b - a + 1)
+    end
+end
+
+local function randomPack(rnd)
+    local p = { today = 100, day_cutoff = CUTOFF, applied = {}, decks = {}, cards = {} }
+    for d = 1, 3 do
+        p.decks[tostring(d)] = {
+            name = "D" .. d, new_today = rnd(0, 4), rev_today = rnd(0, 6), new_per_day = rnd(1, 5), rev_per_day = rnd(2, 8),
+            learn_steps = d == 3 and {} or { 60, 600 }, relearn_steps = d == 2 and {} or { 600 },
+            bury_new = rnd(0, 1) == 1, bury_rev = rnd(0, 1) == 1, bury_interday = rnd(0, 1) == 1,
+        }
+    end
+    for cid = 1, 40 do
+        local q = ({ 0, 0, 1, 2, 2, 3 })[rnd(1, 6)]
+        local c = { cid = cid, nid = 1000 + rnd(1, 25), did = rnd(1, 3), queue = q, type = q == 3 and 1 or q }
+        if q == 1 then c.due_at = T0 + rnd(-1800, 3600); c.left = rnd(1, 2)
+        elseif q == 2 or q == 3 then c.due_day = rnd(-3, 2)
+        else c.new_pos = cid end
+        table.insert(p.cards, c)
+    end
+    return p
+end
+
+local function sameCounts(a, b, where)
+    local pa, ta = a:counts(where)
+    local pb, tb = b:counts(where)
+    for _, k in ipairs({ "new", "learn", "review" }) do eq(ta[k], tb[k], "total " .. k .. " at " .. where) end
+    for did, c in pairs(pa) do
+        for _, k in ipairs({ "new", "learn", "review" }) do eq(c[k], (pb[did] or {})[k], "deck " .. did .. " " .. k) end
+    end
+    for did in pairs(pb) do if not pa[did] then error("deck " .. did .. " missing at " .. where) end end
+    for d = 0, 3 do
+        local deck = d > 0 and d or nil
+        local ca, na = a:nextCard(where, deck)
+        local cb, nb = b:nextCard(where, deck)
+        eq(ca and ca.card.cid, cb and cb.card.cid, "nextCard deck " .. d .. " at " .. where)
+        eq(na, nb, "next_learn deck " .. d)
+    end
+end
+
+-- Reference: the card order and counts as available() (sorted lists + limits) gives them.
+local function refNext(s, now, did)
+    local learn, review, new, next_learn = s:available(now, did)
+    if learn[1] then return learn[1] end
+    if review[1] then return review[1] end
+    if new[1] then return new[1] end
+    if next_learn and next_learn - now <= 20 * 60 then
+        local l = s:available(next_learn, did)
+        if l[1] then return l[1] end
+    end
+    return nil, next_learn
+end
+
+test("incremental answers == rebuild from all answers (random)", function()
+    for seed = 1, 60 do
+        local rnd = lcg(seed)
+        local p = randomPack(rnd)
+        local inc = S.new(p, {})
+        local entries, ts = {}, T0
+        for step = 1, 45 do
+            ts = ts + rnd(0, 1500) + (rnd(1, 15) == 1 and 86400 or 0)
+            local st = inc:nextCard(ts)
+            if not st or rnd(1, 4) == 1 then -- sometimes answer some other card still in play
+                local open = {}
+                for _, x in ipairs(inc.order) do if not x.done then table.insert(open, x) end end
+                if #open == 0 then break end
+                st = open[rnd(1, #open)]
+            end
+            local entry = { id = string.format("s%03d", step), cid = st.card.cid, rating = rnd(1, 4),
+                            answered_at_ms = ts * 1000 }
+            table.insert(entries, entry)
+            inc:answer(st, entry.rating, ts, entry)
+            local fresh = S.new(p, entries)
+            sameCounts(inc, fresh, ts)
+            sameCounts(inc, fresh, ts + 900)
+            sameCounts(inc, fresh, ts + 86400)
+        end
+    end
+end)
+
+test("single-pass counts/nextCard == sorted available() (random)", function()
+    for seed = 100, 160 do
+        local rnd = lcg(seed)
+        local p = randomPack(rnd)
+        local entries, ts = {}, T0
+        for step = 1, 30 do
+            ts = ts + rnd(0, 2000) + (rnd(1, 12) == 1 and 86400 or 0)
+            table.insert(entries, { id = string.format("r%03d", step), cid = rnd(1, 40), rating = rnd(1, 4),
+                                    answered_at_ms = ts * 1000 })
+        end
+        local s = S.new(p, entries)
+        for _, when in ipairs({ T0, ts, ts + 600, ts + 86400, ts + 3 * 86400 }) do
+            for d = 0, 3 do
+                local deck = d > 0 and d or nil
+                local a, an = s:nextCard(when, deck)
+                local b, bn = refNext(s, when, deck)
+                eq(a and a.card.cid, b and b.card.cid, "seed " .. seed .. " deck " .. d)
+                eq(an, bn, "next_learn")
+                local learn, review, new = s:available(when, deck)
+                local _, q = s:queue(when, deck)
+                eq(q.learn, #learn); eq(q.review, #review); eq(q.new, #new)
+            end
+            local per, total = s:counts(when)
+            local learn, review, new = s:available(when)
+            eq(total.learn, #learn); eq(total.review, #review); eq(total.new, #new)
+            local sum = 0
+            for _, c in pairs(per) do sum = sum + c.new + c.learn + c.review end
+            eq(sum, #learn + #review + #new, "per-deck sums")
+        end
+    end
+end)
+
+test("answer() with a clock that went backwards rebuilds in time order", function()
+    local p = pack()
+    local s = S.new(p, {})
+    local e1 = e("b", 4, 1, T0 + 100)
+    s:answer(s.cards[4], 1, T0 + 100, e1)
+    local e2 = e("a", 5, 3, T0)
+    s:answer(s.cards[5], 3, T0, e2)
+    sameCounts(s, S.new(p, { e1, e2 }), T0 + 200)
+end)
+
 print(string.format("%d/%d passed", n - failures, n))
 os.exit(failures == 0 and 0 or 1)

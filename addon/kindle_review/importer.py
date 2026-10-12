@@ -153,7 +153,7 @@ def write_ack(folder: str, ledger: Ledger) -> list[str]:
     applied = sorted(i for i in present if i in ledger.applied)
     skipped = {i: ledger.skipped[i] for i in present if i in ledger.skipped}
     common.atomic_write_json(os.path.join(folder, common.ACK_FILE), {
-        "format": common.FORMAT,
+        "format": common.ACK_FORMAT,
         "updated_at": int(time.time() * 1000),
         "applied": applied,
         "skipped": skipped,
